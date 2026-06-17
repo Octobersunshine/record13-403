@@ -42,6 +42,8 @@ class FieldRule(BaseModel):
     description: Optional[str] = None
     rules: Optional[List["FieldRule"]] = None
     items: Optional[List["FieldRule"]] = None
+    message: Optional[str] = None
+    messages: Optional[Dict[str, str]] = None
 
 
 FieldRule.model_rebuild()
@@ -59,9 +61,91 @@ class DynamicValidator:
         "array": list,
     }
 
+    _error_type_mapping = {
+        "missing": "required",
+        "int_parsing": "type",
+        "float_parsing": "type",
+        "bool_parsing": "type",
+        "string_type": "type",
+        "int_type": "type",
+        "float_type": "type",
+        "bool_type": "type",
+        "list_type": "type",
+        "dict_type": "type",
+        "string_pattern_mismatch": "pattern",
+        "string_too_short": "min_length",
+        "string_too_long": "max_length",
+        "greater_than_equal": "min_value",
+        "less_than_equal": "max_value",
+        "greater_than": "gt",
+        "less_than": "lt",
+        "extra_forbidden": "extra",
+    }
+
     def __init__(self, rules: List[FieldRule]):
         self.rules = rules
         self._model = self._build_model()
+        self._rule_lookup = self._build_rule_lookup(rules)
+
+    def _build_rule_lookup(self, rules: List[FieldRule], prefix: str = "") -> Dict[str, FieldRule]:
+        lookup = {}
+        for rule in rules:
+            field_path = f"{prefix}.{rule.name}" if prefix else rule.name
+            lookup[field_path] = rule
+            if rule.type == "object" and rule.rules:
+                lookup.update(self._build_rule_lookup(rule.rules, field_path))
+            if rule.type == "array" and rule.items:
+                lookup.update(self._build_rule_lookup(rule.items, f"{field_path}.*"))
+        return lookup
+
+    def _get_template_vars(self, rule: FieldRule) -> Dict[str, Any]:
+        return {
+            "name": rule.name,
+            "type": rule.type,
+            "pattern": rule.pattern,
+            "min_length": rule.min_length,
+            "max_length": rule.max_length,
+            "min_value": rule.min_value,
+            "max_value": rule.max_value,
+            "gt": rule.gt,
+            "lt": rule.lt,
+            "description": rule.description,
+        }
+
+    def _format_message(self, template: str, rule: FieldRule) -> str:
+        vars_dict = self._get_template_vars(rule)
+        try:
+            return template.format(**vars_dict)
+        except (KeyError, ValueError):
+            return template
+
+    def _get_custom_message(self, field_path: str, error_type: str, default_msg: str) -> str:
+        lookup_key = field_path
+        if "." in lookup_key:
+            parts = lookup_key.split(".")
+            for i in range(len(parts)):
+                if parts[i].isdigit():
+                    parts[i] = "*"
+            lookup_key = ".".join(parts)
+
+        rule = self._rule_lookup.get(lookup_key)
+        if rule is None:
+            return default_msg
+
+        if rule.message:
+            return self._format_message(rule.message, rule)
+
+        if rule.messages:
+            mapped_type = self._error_type_mapping.get(error_type, error_type)
+            custom_msg = rule.messages.get(mapped_type)
+            if custom_msg:
+                return self._format_message(custom_msg, rule)
+            if mapped_type != error_type:
+                custom_msg = rule.messages.get(error_type)
+                if custom_msg:
+                    return self._format_message(custom_msg, rule)
+
+        return default_msg
 
     def _build_nested_model(self, rules: List[FieldRule], model_name: str = "NestedModel") -> Type[BaseModel]:
         fields = {}
@@ -125,9 +209,10 @@ class DynamicValidator:
             errors = []
             for error in e.errors():
                 field_name = ".".join(str(loc) for loc in error["loc"])
+                custom_message = self._get_custom_message(field_name, error["type"], error["msg"])
                 errors.append({
                     "field": field_name,
-                    "message": error["msg"],
+                    "message": custom_message,
                     "type": error["type"],
                 })
             return ValidationResult(success=False, errors=errors)
