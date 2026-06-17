@@ -40,6 +40,11 @@ class FieldRule(BaseModel):
     gt: Optional[Union[int, float]] = None
     lt: Optional[Union[int, float]] = None
     description: Optional[str] = None
+    rules: Optional[List["FieldRule"]] = None
+    items: Optional[List["FieldRule"]] = None
+
+
+FieldRule.model_rebuild()
 
 
 class DynamicValidator:
@@ -50,18 +55,26 @@ class DynamicValidator:
         "bool": bool,
         "list": list,
         "dict": dict,
+        "object": dict,
+        "array": list,
     }
 
     def __init__(self, rules: List[FieldRule]):
         self.rules = rules
         self._model = self._build_model()
 
-    def _build_model(self) -> Type[BaseModel]:
+    def _build_nested_model(self, rules: List[FieldRule], model_name: str = "NestedModel") -> Type[BaseModel]:
         fields = {}
 
-        for rule in self.rules:
+        for rule in rules:
             field_kwargs = {}
             python_type = self._type_mapping.get(rule.type, str)
+
+            if rule.type == "object" and rule.rules:
+                python_type = self._build_nested_model(rule.rules, f"{model_name}_{rule.name}")
+            elif rule.type == "array" and rule.items:
+                item_type = self._build_nested_model(rule.items, f"{model_name}_{rule.name}_item")
+                python_type = List[item_type]
 
             if not rule.required and rule.default is not None:
                 field_kwargs["default"] = rule.default
@@ -69,22 +82,23 @@ class DynamicValidator:
                 field_kwargs["default"] = None
                 python_type = Optional[python_type]
 
-            if rule.min_length is not None:
-                field_kwargs["min_length"] = rule.min_length
-            if rule.max_length is not None:
-                field_kwargs["max_length"] = rule.max_length
+            if rule.type not in ("object", "array"):
+                if rule.min_length is not None:
+                    field_kwargs["min_length"] = rule.min_length
+                if rule.max_length is not None:
+                    field_kwargs["max_length"] = rule.max_length
 
-            if rule.min_value is not None:
-                field_kwargs["ge"] = rule.min_value
-            if rule.max_value is not None:
-                field_kwargs["le"] = rule.max_value
-            if rule.gt is not None:
-                field_kwargs["gt"] = rule.gt
-            if rule.lt is not None:
-                field_kwargs["lt"] = rule.lt
+                if rule.min_value is not None:
+                    field_kwargs["ge"] = rule.min_value
+                if rule.max_value is not None:
+                    field_kwargs["le"] = rule.max_value
+                if rule.gt is not None:
+                    field_kwargs["gt"] = rule.gt
+                if rule.lt is not None:
+                    field_kwargs["lt"] = rule.lt
 
-            if rule.pattern is not None:
-                field_kwargs["pattern"] = rule.pattern
+                if rule.pattern is not None:
+                    field_kwargs["pattern"] = rule.pattern
 
             if rule.description:
                 field_kwargs["description"] = rule.description
@@ -93,12 +107,15 @@ class DynamicValidator:
 
         model_config = ConfigDict(extra="forbid")
         model = create_model(
-            "DynamicModel",
+            model_name,
             __config__=model_config,
             **fields,
         )
 
         return model
+
+    def _build_model(self) -> Type[BaseModel]:
+        return self._build_nested_model(self.rules, "DynamicModel")
 
     def validate(self, data: Dict[str, Any]) -> ValidationResult:
         try:
